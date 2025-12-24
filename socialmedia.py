@@ -1,235 +1,438 @@
 #!/usr/bin/env python3
 """
-Discord bot: aktualisiert Channel(s) mit aktuellen Followerzahlen von TikTok und/oder Instagram (Scraping).
-Konfigurierbar: TikTok und/oder Instagram aktivieren; separate Channel-IDs möglich.
-
-WARNUNG:
-- Scraping ist anfällig für Änderungen, CAPTCHAs und ggf. gegen ToS der Plattformen.
-- Verwende die Lösung sparsam (Default-Intervall = 4 Stunden).
+Discord bot: aktualisiert Channel(s) mit Followerzahlen (TikTok, Instagram).
+Beachtet:
+ - Discord API (edits nur bei Änderung, permission checks, retry/backoff, per-channel throttle)
+ - Externe API Rate Limits (Retry-After, per-service min interval, request retries/backoff)
 """
 import os
 import re
 import json
+import time
 import logging
-from typing import Optional
+import asyncio
+from typing import Optional, Dict, Any
 
 import aiohttp
 import discord
 from discord.ext import tasks, commands
 from dotenv import load_dotenv
+from urllib.parse import urlparse, urlunparse
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+# ---------------- Configuration (env) ----------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("social-follower-bot")
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# Allgemeiner Fallback-Channel (optional). Wird verwendet, wenn keine separate Plattform-Channel-ID gesetzt ist.
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
-
-# Optionale separate Channel-IDs pro Plattform (überschreiben CHANNEL_ID)
-CHANNEL_ID_TIKTOK = int(os.getenv("CHANNEL_ID_TIKTOK", "0"))
 CHANNEL_ID_INSTAGRAM = int(os.getenv("CHANNEL_ID_INSTAGRAM", "0"))
+CHANNEL_ID_TIKTOK = int(os.getenv("CHANNEL_ID_TIKTOK", "0"))
 
-# Plattform-Benutzernamen (ohne @)
 TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME", "").lstrip("@")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "").lstrip("@")
+INSTAGRAM_PROFILE_URL = os.getenv("INSTAGRAM_PROFILE_URL", "").strip()
+INSTAGRAM_COOKIE = os.getenv("INSTAGRAM_COOKIE", "")
 
-# Aktivierung per ENV (true/false). Wenn nicht gesetzt, werden Plattformen aktiviert, wenn ein Username gesetzt ist.
-def parse_bool_env(name: str, default: Optional[bool] = None) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default if default is not None else False
-    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+USER_AGENT = os.getenv("USER_AGENT",
+                       "Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) "
+                       "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1")
 
-ENABLE_TIKTOK = parse_bool_env("ENABLE_TIKTOK", default=(bool(TIKTOK_USERNAME)))
-ENABLE_INSTAGRAM = parse_bool_env("ENABLE_INSTAGRAM", default=(bool(INSTAGRAM_USERNAME)))
+ENABLE_TIKTOK = os.getenv("ENABLE_TIKTOK")
+if ENABLE_TIKTOK is None:
+    ENABLE_TIKTOK = bool(TIKTOK_USERNAME)
+else:
+    ENABLE_TIKTOK = str(ENABLE_TIKTOK).lower() in ("1", "true", "yes", "on")
 
-# Update-Intervall (Sekunden). Default 4 Stunden = 14400 Sekunden
-UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", str(4 * 3600)))
+ENABLE_INSTAGRAM = os.getenv("ENABLE_INSTAGRAM")
+if ENABLE_INSTAGRAM is None:
+    ENABLE_INSTAGRAM = bool(INSTAGRAM_USERNAME or INSTAGRAM_PROFILE_URL)
+else:
+    ENABLE_INSTAGRAM = str(ENABLE_INSTAGRAM).lower() in ("1", "true", "yes", "on")
 
-# HTTP User-Agent
-USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                      "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                      "Chrome/120.0.0.0 Safari/537.36")
+UPDATE_INTERVAL = int(os.getenv("UPDATE_INTERVAL", str(4 * 3600)))  # default 4 hours
+MIN_UPDATE_SECONDS = int(os.getenv("MIN_UPDATE_SECONDS", "60"))
+EDIT_MAX_RETRIES = int(os.getenv("EDIT_MAX_RETRIES", "3"))
+EDIT_BACKOFF_BASE = float(os.getenv("EDIT_BACKOFF_BASE", "2.0"))
+MAX_CONCURRENT_EDITS = int(os.getenv("MAX_CONCURRENT_EDITS", "2"))
 
+# External API rate-limit config
+EXTERNAL_MAX_RETRIES = int(os.getenv("EXTERNAL_MAX_RETRIES", "3"))
+EXTERNAL_BACKOFF_BASE = float(os.getenv("EXTERNAL_BACKOFF_BASE", "2.0"))
+EXTERNAL_MAX_CONCURRENT_REQUESTS = int(os.getenv("EXTERNAL_MAX_CONCURRENT_REQUESTS", "3"))
+
+# Minimum interval between calls to each external service (seconds)
+INSTAGRAM_MIN_INTERVAL = int(os.getenv("INSTAGRAM_MIN_INTERVAL", "300"))  # default 5 minutes
+TIKTOK_MIN_INTERVAL = int(os.getenv("TIKTOK_MIN_INTERVAL", "300"))
+
+# ---------------- Bot and state ----------------
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+_last_update_ts: Dict[int, float] = {}          # per-channel last edit timestamp
+_last_external_ts: Dict[str, float] = {}        # per-service last request timestamp, e.g. "instagram", "tiktok"
+_edit_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EDITS)
+_external_semaphore = asyncio.Semaphore(EXTERNAL_MAX_CONCURRENT_REQUESTS)
 
-async def fetch_page(session: aiohttp.ClientSession, url: str, headers: dict = None, timeout: int = 20) -> str:
-    h = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"}
-    if headers:
-        h.update(headers)
-    async with session.get(url, headers=h, timeout=timeout) as resp:
-        text = await resp.text(errors="ignore")
-        if resp.status != 200:
-            logger.debug("GET %s returned %s", url, resp.status)
-        return text
+# ---------------- Utilities: external request with retry & Retry-After handling ----------------
+async def request_with_retries(session: aiohttp.ClientSession, method: str, url: str,
+                               headers: Optional[Dict[str, str]] = None,
+                               params: Optional[Dict[str, Any]] = None,
+                               json_data: Optional[Any] = None,
+                               timeout: int = 15,
+                               service_name: Optional[str] = None) -> aiohttp.ClientResponse:
+    """
+    Perform an HTTP request with retries and handling of 429 Retry-After.
+    Returns the final aiohttp.ClientResponse (caller should await .text()/.json()).
+    Raises RuntimeError on unrecoverable failure.
+    """
+    attempt = 0
+    backoff = 1.0
+    last_exc = None
 
-
-#
-# TikTok scraping (same strategies as before)
-#
-def extract_tiktok_from_sigi_state(html: str) -> Optional[int]:
-    m = re.search(r'<script[^>]*id=["\']SIGI_STATE["\'][^>]*>(.*?)</script>', html, re.S | re.I)
-    if not m:
-        return None
-    try:
-        raw = m.group(1).strip()
-        data = json.loads(raw)
-    except Exception:
-        return None
-
-    um = data.get("UserModule") or data.get("userModule") or {}
-    users = um.get("users") or um.get("userList") or {}
-    for v in users.values():
-        if isinstance(v, dict):
-            stats = v.get("stats")
-            if stats and "followerCount" in stats:
-                try:
-                    return int(stats["followerCount"])
-                except Exception:
-                    continue
-    return None
-
-
-def extract_tiktok_by_regex(html: str) -> Optional[int]:
-    m = re.search(r'"followerCount"\s*:\s*([0-9]{1,15})', html)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return None
-    m2 = re.search(r'([\d.,]+)\s*Followers', html, re.I)
-    if m2:
-        raw = m2.group(1).replace(",", "").replace(".", "")
-        try:
-            return int(raw)
-        except Exception:
-            return None
-    return None
-
-
-async def fetch_tiktok_followers(session: aiohttp.ClientSession, username: str) -> int:
-    if not username:
-        raise RuntimeError("TIKTOK_USERNAME nicht gesetzt")
-
-    url = f"https://www.tiktok.com/@{username}"
-    html = await fetch_page(session, url)
-
-    count = extract_tiktok_from_sigi_state(html)
-    if count is not None:
-        return count
-
-    count = extract_tiktok_by_regex(html)
-    if count is not None:
-        return count
-
-    html2 = await fetch_page(session, f"https://www.tiktok.com/@{username}?lang=en")
-    count = extract_tiktok_from_sigi_state(html2) or extract_tiktok_by_regex(html2)
-    if count is not None:
-        return count
-
-    node_url = f"https://www.tiktok.com/node/share/user/@{username}"
-    try:
-        async with session.get(node_url, headers={"User-Agent": USER_AGENT}, timeout=10) as resp:
-            if resp.status == 200:
-                try:
-                    j = await resp.json()
-                    for path in [
-                        ("user", "stats", "followerCount"),
-                        ("userInfo", "stats", "followerCount"),
-                        ("userInfo", "user", "stats", "followerCount"),
-                    ]:
-                        cur = j
-                        for p in path:
-                            if isinstance(cur, dict) and p in cur:
-                                cur = cur[p]
-                            else:
-                                cur = None
-                                break
-                        if isinstance(cur, int):
-                            return int(cur)
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    raise RuntimeError("TikTok: Followerzahl nicht gefunden (Scraping failed).")
-
-
-#
-# Instagram scraping
-#
-async def fetch_instagram_followers(session: aiohttp.ClientSession, username: str) -> int:
-    if not username:
-        raise RuntimeError("INSTAGRAM_USERNAME nicht gesetzt")
-
-    # Strategy 1: JSON endpoint (may or may not work)
-    json_url = f"https://www.instagram.com/{username}/?__a=1&__d=dis"
-    try:
-        async with session.get(json_url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, timeout=10) as resp:
-            if resp.status == 200:
-                try:
-                    j = await resp.json()
-                    cur = j
-                    for k in ("graphql", "user", "edge_followed_by", "count"):
-                        if isinstance(cur, dict) and k in cur:
-                            cur = cur[k]
+    async with _external_semaphore:
+        while attempt <= EXTERNAL_MAX_RETRIES:
+            attempt += 1
+            try:
+                logger.debug("External request attempt %s: %s %s", attempt, method.upper(), url)
+                async with session.request(method, url, headers=headers, params=params, json=json_data, timeout=timeout) as resp:
+                    status = resp.status
+                    if status in (200, 201):
+                        return resp
+                    # Handle 429 with Retry-After
+                    if status == 429:
+                        ra = resp.headers.get("Retry-After")
+                        if ra:
+                            try:
+                                wait = float(ra)
+                            except Exception:
+                                wait = backoff * EXTERNAL_BACKOFF_BASE
                         else:
-                            cur = None
-                            break
-                    if isinstance(cur, int):
-                        return int(cur)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                            wait = backoff * EXTERNAL_BACKOFF_BASE
+                        logger.warning("Received 429 from %s (%s). Waiting %.1fs before retry (attempt %s/%s).", service_name or url, url, wait, attempt, EXTERNAL_MAX_RETRIES)
+                        await asyncio.sleep(wait)
+                        backoff *= EXTERNAL_BACKOFF_BASE
+                        continue
+                    # Retry on 5xx
+                    if 500 <= status < 600:
+                        wait = backoff * EXTERNAL_BACKOFF_BASE
+                        logger.warning("Received %s from %s. Sleeping %.1fs and retrying (attempt %s/%s).", status, url, wait, attempt, EXTERNAL_MAX_RETRIES)
+                        await asyncio.sleep(wait)
+                        backoff *= EXTERNAL_BACKOFF_BASE
+                        continue
+                    # For 403/401/400 treat as unrecoverable (likely blocked or invalid request)
+                    text = await resp.text()
+                    raise RuntimeError(f"Request to {url} returned status {status}: {text[:300]}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_exc = e
+                wait = backoff * EXTERNAL_BACKOFF_BASE
+                logger.debug("External request error (%s): %s. Sleeping %.1fs before retry.", url, e, wait)
+                await asyncio.sleep(wait)
+                backoff *= EXTERNAL_BACKOFF_BASE
+        # exhausted retries
+        raise RuntimeError(f"External request to {url} failed after {EXTERNAL_MAX_RETRIES} retries. Last error: {last_exc}")
 
-    # Strategy 2: profile page regex
-    url = f"https://www.instagram.com/{username}/"
-    html = await fetch_page(session, url)
-    m = re.search(r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*([0-9]{1,15})', html)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            pass
+# ---------------- External scrapers (rate-aware) ----------------
+async def _throttle_service(service_key: str, min_interval: int):
+    """Ensure min_interval between calls to a named service."""
+    now = time.time()
+    last = _last_external_ts.get(service_key, 0)
+    since = now - last
+    if since < min_interval:
+        to_sleep = min_interval - since
+        logger.info("Throttling service %s: sleeping %.1fs to respect min interval", service_key, to_sleep)
+        await asyncio.sleep(to_sleep)
+    _last_external_ts[service_key] = time.time()
 
-    # Strategy 3: window._sharedData
-    m2 = re.search(r'window\._sharedData\s*=\s*({.*?});</script>', html, re.S)
-    if m2:
+
+async def fetch_instagram_followers(session: aiohttp.ClientSession, username: str,
+                                    profile_url_override: Optional[str] = None) -> int:
+    """Fetch Instagram follower count honoring rate limits and Retry-After."""
+    if not username and not profile_url_override:
+        raise RuntimeError("INSTAGRAM_USERNAME oder INSTAGRAM_PROFILE_URL muss gesetzt sein")
+
+    await _throttle_service("instagram", INSTAGRAM_MIN_INTERVAL)
+
+    cookie = INSTAGRAM_COOKIE or ""
+    mobile_ua = USER_AGENT
+
+    # 1) i.instagram.com endpoint
+    if username:
+        i_api = f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}"
+        headers_api = {
+            "User-Agent": mobile_ua,
+            "Referer": f"https://www.instagram.com/{username}/",
+            "X-Requested-With": "XMLHttpRequest",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-IG-App-ID": "936619743392459",
+        }
+        if cookie:
+            headers_api["Cookie"] = cookie
         try:
-            d = json.loads(m2.group(1))
-            for path in [
-                ("entry_data", "ProfilePage", 0, "graphql", "user", "edge_followed_by", "count"),
-            ]:
-                cur = d
-                ok = True
-                for p in path:
-                    if isinstance(p, int):
-                        try:
-                            cur = cur[p]
-                        except Exception:
-                            ok = False
-                            break
-                    else:
+            resp = await request_with_retries(session, "GET", i_api, headers=headers_api, service_name="instagram")
+            text = await resp.text()
+            try:
+                j = json.loads(text)
+                for path in (("data", "user", "edge_followed_by", "count"),
+                             ("user", "edge_followed_by", "count")):
+                    cur = j
+                    ok = True
+                    for p in path:
                         if isinstance(cur, dict) and p in cur:
                             cur = cur[p]
                         else:
                             ok = False
                             break
-                if ok and isinstance(cur, int):
+                    if ok and isinstance(cur, int):
+                        return int(cur)
+            except Exception:
+                logger.debug("i.instagram.com: JSON parse failed or unexpected structure")
+        except Exception as e:
+            logger.debug("i.instagram.com attempt error: %s", e)
+
+    # 2) ?__a=1 endpoint
+    if username:
+        json_url = f"https://www.instagram.com/{username}/?__a=1&__d=dis"
+        headers_json = {"User-Agent": mobile_ua, "Referer": f"https://www.instagram.com/{username}/", "X-IG-App-ID": "936619743392459"}
+        if cookie:
+            headers_json["Cookie"] = cookie
+        try:
+            resp = await request_with_retries(session, "GET", json_url, headers=headers_json, service_name="instagram")
+            text = await resp.text()
+            try:
+                j = json.loads(text)
+                cur = j
+                for k in ("graphql", "user", "edge_followed_by", "count"):
+                    if isinstance(cur, dict) and k in cur:
+                        cur = cur[k]
+                    else:
+                        cur = None
+                        break
+                if isinstance(cur, int):
                     return int(cur)
+            except Exception:
+                logger.debug("?__a=1 parse failed or unexpected structure")
+        except Exception as e:
+            logger.debug("?__a=1 attempt error: %s", e)
+
+    # 3) HTML fallback
+    profile_url = ""
+    if profile_url_override:
+        try:
+            p = urlparse(profile_url_override)
+            p = p._replace(fragment="")
+            profile_url = urlunparse(p)
         except Exception:
-            pass
+            profile_url = profile_url_override
+    elif username:
+        profile_url = f"https://www.instagram.com/{username}/"
 
-    raise RuntimeError("Instagram: Followerzahl nicht gefunden (Scraping failed).")
+    if profile_url:
+        try:
+            headers_html = {"Referer": "https://www.instagram.com/", "User-Agent": mobile_ua}
+            if cookie:
+                headers_html["Cookie"] = cookie
+            resp = await request_with_retries(session, "GET", profile_url, headers=headers_html, service_name="instagram")
+            html = await resp.text()
+            m = re.search(r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*([0-9]{1,15})', html)
+            if m:
+                return int(m.group(1))
+            m2 = re.search(r'window\._sharedData\s*=\s*({.*?});</script>', html, re.S)
+            if m2:
+                try:
+                    d = json.loads(m2.group(1))
+                    cur = d
+                    for p in ("entry_data", "ProfilePage", 0, "graphql", "user", "edge_followed_by", "count"):
+                        if isinstance(p, int):
+                            try:
+                                cur = cur[p]
+                            except Exception:
+                                cur = None
+                                break
+                        else:
+                            if isinstance(cur, dict) and p in cur:
+                                cur = cur[p]
+                            else:
+                                cur = None
+                                break
+                    if isinstance(cur, int):
+                        return int(cur)
+                except Exception:
+                    logger.debug("window._sharedData parse failed")
+            m3 = re.search(r'<script type="application/ld\+json">(.*?)</script>', html, re.S)
+            if m3:
+                try:
+                    ld = json.loads(m3.group(1))
+                    if isinstance(ld, dict):
+                        stats = ld.get("interactionStatistic") or ld.get("mainEntityofPage")
+                        if isinstance(stats, dict):
+                            count = stats.get("userInteractionCount")
+                            if isinstance(count, (int, str)):
+                                return int(count)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug("HTML fallback error: %s", e)
+
+    raise RuntimeError("Instagram: Followerzahl nicht gefunden (alle Strategien fehlgeschlagen).")
 
 
+async def fetch_tiktok_followers(session: aiohttp.ClientSession, username: str) -> int:
+    """Fetch TikTok follower count honoring rate limits."""
+    if not username:
+        raise RuntimeError("TIKTOK_USERNAME nicht gesetzt")
+
+    await _throttle_service := None  # placeholder to avoid linter error in older systems
+    # throttle tiktok
+    now = time.time()
+    last = _last_external_ts.get("tiktok", 0)
+    if now - last < TIKTOK_MIN_INTERVAL:
+        wait = TIKTOK_MIN_INTERVAL - (now - last)
+        logger.info("Throttling tiktok: sleeping %.1fs to respect min interval", wait)
+        await asyncio.sleep(wait)
+    _last_external_ts["tiktok"] = time.time()
+
+    url = f"https://www.tiktok.com/@{username}"
+    try:
+        resp = await request_with_retries(session, "GET", url, headers={"User-Agent": USER_AGENT}, service_name="tiktok")
+        html = await resp.text()
+        # quick regex attempt
+        m = re.search(r'"followerCount"\s*:\s*([0-9]{1,15})', html)
+        if m:
+            return int(m.group(1))
+        m2 = re.search(r'([\d.,]+)\s*Followers', html, re.I)
+        if m2:
+            raw = m2.group(1).replace(",", "").replace(".", "")
+            return int(raw)
+    except Exception as e:
+        logger.debug("TikTok profile page attempt failed: %s", e)
+
+    # fallback to node/share endpoint
+    node = f"https://www.tiktok.com/node/share/user/@{username}"
+    try:
+        resp = await request_with_retries(session, "GET", node, headers={"User-Agent": USER_AGENT}, service_name="tiktok")
+        j = await resp.json()
+        for path in [("user", "stats", "followerCount"), ("userInfo", "stats", "followerCount")]:
+            cur = j
+            for p in path:
+                if isinstance(cur, dict) and p in cur:
+                    cur = cur[p]
+                else:
+                    cur = None
+                    break
+            if isinstance(cur, int):
+                return int(cur)
+    except Exception as e:
+        logger.debug("TikTok node endpoint attempt failed: %s", e)
+
+    raise RuntimeError("TikTok: Followerzahl nicht gefunden.")
+
+
+# ---------------- Discord-safe edit helpers (unchanged logic) ----------------
+def _can_bot_manage_channel(guild: discord.Guild, channel: discord.abc.GuildChannel) -> bool:
+    try:
+        me = guild.me
+        if me is None:
+            me = guild.get_member(bot.user.id)
+        if me is None:
+            return False
+        perms = channel.permissions_for(me)
+        return perms.manage_channels
+    except Exception:
+        return False
+
+
+async def safe_edit_channel_obj(channel: discord.abc.GuildChannel, new_name: Optional[str] = None,
+                                new_topic: Optional[str] = None) -> bool:
+    try:
+        if isinstance(channel, discord.TextChannel):
+            cur = channel.topic or ""
+            if new_topic is None:
+                return True
+            if cur.strip() == new_topic.strip():
+                logger.debug("No topic change needed for channel %s", channel.id)
+                return True
+            await channel.edit(topic=new_topic)
+            logger.info("Updated topic for channel %s -> %s", channel.id, new_topic)
+            return True
+        else:
+            cur = channel.name or ""
+            if new_name is None:
+                return True
+            if cur.strip() == new_name.strip():
+                logger.debug("No name change needed for channel %s", channel.id)
+                return True
+            await channel.edit(name=new_name)
+            logger.info("Updated name for channel %s -> %s", channel.id, new_name)
+            return True
+    except discord.Forbidden:
+        logger.error("Missing permissions to edit channel %s", getattr(channel, "id", "unknown"))
+        raise
+    except discord.NotFound:
+        logger.warning("Channel not found when attempting edit: %s", getattr(channel, "id", "unknown"))
+        raise
+    except discord.HTTPException as e:
+        logger.warning("HTTPException when editing channel %s: %s", getattr(channel, "id", "unknown"), e)
+        raise
+
+
+async def edit_with_retry(channel: discord.abc.GuildChannel, new_name: Optional[str] = None,
+                          new_topic: Optional[str] = None, max_retries: int = EDIT_MAX_RETRIES) -> bool:
+    cid = getattr(channel, "id", 0)
+    now = time.time()
+    last_ts = _last_update_ts.get(cid, 0)
+    if now - last_ts < MIN_UPDATE_SECONDS:
+        logger.info("Skipping edit for channel %s: only %.1fs since last update (min %.1fs)", cid, now - last_ts, MIN_UPDATE_SECONDS)
+        return False
+
+    guild = channel.guild
+    if not _can_bot_manage_channel(guild, channel):
+        logger.error("Bot lacks Manage Channels permission for guild %s / channel %s", guild.id if guild else "?", cid)
+        return False
+
+    backoff = 1.0
+    attempt = 0
+    async with _edit_semaphore:
+        while attempt <= max_retries:
+            try:
+                attempt += 1
+                await safe_edit_channel_obj(channel, new_name=new_name, new_topic=new_topic)
+                _last_update_ts[cid] = time.time()
+                return True
+            except discord.HTTPException as e:
+                # try to extract retry-after from response headers if available (discord.py handles rate limits usually)
+                retry_after = None
+                try:
+                    retry_after = float(getattr(e, "retry_after", None) or 0)
+                except Exception:
+                    retry_after = None
+                if retry_after and retry_after > 0:
+                    logger.warning("Discord rate limited: sleeping %.1fs (retry-after)", retry_after)
+                    await asyncio.sleep(retry_after)
+                else:
+                    sleep_for = backoff * EDIT_BACKOFF_BASE
+                    logger.warning("Edit attempt %s failed; sleeping %.1fs before retry", attempt, sleep_for)
+                    await asyncio.sleep(sleep_for)
+                    backoff *= EDIT_BACKOFF_BASE
+            except (discord.Forbidden, discord.NotFound) as e:
+                logger.error("Unrecoverable error editing channel %s: %s", cid, e)
+                return False
+            except Exception as e:
+                logger.warning("Unexpected error editing channel %s: %s", cid, e)
+                sleep_for = backoff * EDIT_BACKOFF_BASE
+                await asyncio.sleep(sleep_for)
+                backoff *= EDIT_BACKOFF_BASE
+        logger.error("Exceeded max retries editing channel %s", cid)
+        return False
+
+
+# ---------------- Update task ----------------
 def format_text_single(platform: str, count: int) -> str:
     if platform.lower() == "tiktok":
         return f"TikTok: {count:,} Followers"
@@ -238,116 +441,55 @@ def format_text_single(platform: str, count: int) -> str:
     return f"{platform}: {count:,} Followers"
 
 
-def format_combined_text(t_count: Optional[int], i_count: Optional[int]) -> str:
-    parts = []
-    if t_count is not None:
-        parts.append(f"TikTok: {t_count:,} Followers")
-    if i_count is not None:
-        parts.append(f"Instagram: {i_count:,} Followers")
-    if not parts:
-        return "Followers: unknown"
-    text = " | ".join(parts)
-    if len(text) > 90:
-        short = []
-        if t_count is not None:
-            short.append(f"TT:{t_count:,}")
-        if i_count is not None:
-            short.append(f"IG:{i_count:,}")
-        text = " | ".join(short)
-    return text
-
-
-async def update_channel_by_id(channel_id: int, new_text: str):
-    if channel_id <= 0:
-        logger.debug("Ungültige channel_id: %s", channel_id)
-        return
-    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
-    if not guild:
-        logger.warning("Guild nicht gefunden (GUILD_ID fehlt oder Bot nicht auf Server).")
-        return
-    channel = guild.get_channel(channel_id)
-    if not channel:
-        logger.warning("Channel nicht gefunden (ID: %s).", channel_id)
-        return
-    try:
-        if isinstance(channel, discord.TextChannel):
-            await channel.edit(topic=new_text)
-            logger.info("Text-Channel topic aktualisiert (ID %s) -> %s", channel_id, new_text)
-        else:
-            await channel.edit(name=new_text)
-            logger.info("Channel name aktualisiert (ID %s) -> %s", channel_id, new_text)
-    except Exception as e:
-        logger.exception("Fehler beim Ändern des Channels (ID %s): %s", channel_id, e)
-
-
 @tasks.loop(seconds=UPDATE_INTERVAL)
 async def update_follower_count():
     await bot.wait_until_ready()
+    guild = bot.get_guild(GUILD_ID) if GUILD_ID else None
+    if not guild:
+        logger.warning("Guild not found (GUILD_ID missing or bot not on server).")
+        return
+
     async with aiohttp.ClientSession() as session:
-        t_count = None
-        i_count = None
-
-        # Fetch enabled platforms
-        if ENABLE_TIKTOK:
-            if not TIKTOK_USERNAME:
-                logger.warning("ENABLE_TIKTOK=true aber TIKTOK_USERNAME leer. Überspringe TikTok.")
-            else:
-                try:
-                    t_count = await fetch_tiktok_followers(session, TIKTOK_USERNAME)
-                    logger.info("TikTok followers: %s", t_count)
-                except Exception as e:
-                    logger.warning("TikTok fetch failed: %s", e)
-
+        # Instagram
         if ENABLE_INSTAGRAM:
-            if not INSTAGRAM_USERNAME:
-                logger.warning("ENABLE_INSTAGRAM=true aber INSTAGRAM_USERNAME leer. Überspringe Instagram.")
-            else:
-                try:
-                    i_count = await fetch_instagram_followers(session, INSTAGRAM_USERNAME)
-                    logger.info("Instagram followers: %s", i_count)
-                except Exception as e:
-                    logger.warning("Instagram fetch failed: %s", e)
+            try:
+                count = await fetch_instagram_followers(session, INSTAGRAM_USERNAME, profile_url_override=(INSTAGRAM_PROFILE_URL or None))
+                logger.info("Instagram followers: %s", count)
+                target_id = CHANNEL_ID_INSTAGRAM or CHANNEL_ID
+                if target_id > 0:
+                    channel = guild.get_channel(target_id)
+                    if channel:
+                        await edit_with_retry(channel, new_topic=format_text_single("instagram", count))
+                    else:
+                        logger.warning("Instagram target channel %s not found.", target_id)
+            except Exception as e:
+                logger.warning("Instagram fetch failed: %s", e)
 
-        # Decide target channels and update
-        # If both platforms enabled and both map to same channel (or only CHANNEL_ID), write combined text.
-        # Otherwise update platform-specific channels separately.
-        # Resolve platform channel ids with precedence: PLATFORM_CHANNEL_ID -> CHANNEL_ID -> 0 (skip)
-        t_channel = CHANNEL_ID_TIKTOK or CHANNEL_ID
-        i_channel = CHANNEL_ID_INSTAGRAM or CHANNEL_ID
-
-        # Both enabled and channel ids equal and >0 -> combined update
-        if (ENABLE_TIKTOK and ENABLE_INSTAGRAM) and (t_channel > 0 and i_channel > 0) and (t_channel == i_channel):
-            # If neither count found -> skip
-            if t_count is None and i_count is None:
-                logger.warning("Keine Follower-Zahlen ermittelt für beide Plattformen. Skip update.")
-                return
-            new_text = format_combined_text(t_count, i_count)
-            await update_channel_by_id(t_channel, new_text)
-            return
-
-        # Otherwise update each enabled platform in its channel (if channel id valid)
-        if ENABLE_TIKTOK and t_channel > 0:
-            if t_count is None:
-                logger.warning("Keine TikTok-Zahl ermittelt, überspringe TikTok-Update.")
-            else:
-                await update_channel_by_id(t_channel, format_text_single("tiktok", t_count))
-
-        if ENABLE_INSTAGRAM and i_channel > 0:
-            if i_count is None:
-                logger.warning("Keine Instagram-Zahl ermittelt, überspringe Instagram-Update.")
-            else:
-                await update_channel_by_id(i_channel, format_text_single("instagram", i_count))
+        # TikTok
+        if ENABLE_TIKTOK:
+            try:
+                count = await fetch_tiktok_followers(session, TIKTOK_USERNAME)
+                logger.info("TikTok followers: %s", count)
+                target_id = CHANNEL_ID_TIKTOK or CHANNEL_ID
+                if target_id > 0:
+                    channel = guild.get_channel(target_id)
+                    if channel:
+                        await edit_with_retry(channel, new_topic=format_text_single("tiktok", count))
+                    else:
+                        logger.warning("TikTok target channel %s not found.", target_id)
+            except Exception as e:
+                logger.warning("TikTok fetch failed: %s", e)
 
 
 @bot.event
 async def on_ready():
-    logger.info("Bot eingeloggt als %s (ID: %s)", bot.user, bot.user.id)
+    logger.info("Bot logged in as %s (ID: %s)", bot.user, bot.user.id)
     if not update_follower_count.is_running():
         update_follower_count.start()
 
 
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
-        logger.error("DISCORD_TOKEN nicht gesetzt. Beende.")
+        logger.error("DISCORD_TOKEN not set. Exiting.")
         raise SystemExit(1)
     bot.run(DISCORD_TOKEN)
